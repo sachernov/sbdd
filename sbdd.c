@@ -4,6 +4,7 @@
 #include <linux/mm.h>
 #include <linux/bio.h>
 #include <linux/bvec.h>
+#include <linux/device.h>
 #include <linux/init.h>
 #include <linux/wait.h>
 #include <linux/stat.h>
@@ -14,6 +15,7 @@
 #include <linux/genhd.h>
 #include <linux/blkdev.h>
 #include <linux/string.h>
+#include <linux/sysfs.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/vmalloc.h>
@@ -34,11 +36,79 @@ struct sbdd {
 	u8                      *data;
 	struct gendisk          *gd;
 	struct request_queue    *q;
+	struct block_device     *target_device;               // Target device
+	char                    target_device_path[PATH_MAX]; // Path of the target device
 };
 
 static struct sbdd      __sbdd;
+static struct bio_set   __sbdd_bio_set;
 static int              __sbdd_major = 0;
 static unsigned long    __sbdd_capacity_mib = 100;
+
+
+static ssize_t target_device_path_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%s\n", __sbdd.target_device_path);
+}
+
+static ssize_t target_device_path_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t len)
+{
+	static char target_device_path[PATH_MAX];
+	struct block_device *target_device;
+	sector_t capacity;
+
+	if (len >= PATH_MAX)
+		return -EINVAL;
+
+    if (len <= 1) {
+		__sbdd.target_device_path[len-1] = '\0';
+		__sbdd.target_device = NULL;
+        pr_debug("removed target block device\n");
+	} else {
+		strncpy(target_device_path, buf, len);
+		target_device_path[len-1] = '\0';
+		// Open the target device. In case of failure do nothing.
+	    target_device = blkdev_get_by_path(target_device_path, FMODE_READ|FMODE_WRITE, THIS_MODULE); 
+    	if (IS_ERR(target_device)) {
+        	pr_err("failed to open target block device %s, %ld\n", target_device_path, PTR_ERR(target_device));
+    	} else {
+			strcpy(__sbdd.target_device_path, target_device_path);
+			__sbdd.target_device = target_device;
+			capacity = get_capacity(__sbdd.target_device->bd_disk);
+			pr_debug("set target_device_path = %s as target block device, capacity = %llu\n", __sbdd.target_device_path, capacity);
+		}
+	}
+
+    return len;
+}
+
+static DEVICE_ATTR_RW(target_device_path);
+
+static struct attribute *sbdd_disk_attrs[] = {
+        &dev_attr_target_device_path.attr,
+        NULL,
+};
+
+static const struct attribute_group sbdd_disk_attr_group = {
+        .attrs = sbdd_disk_attrs,
+};
+
+static void sbdd_forward_bio(struct bio *bio, struct block_device *bdev)
+{
+	struct bio *clone_bio;
+	
+    // Clone the original BIO
+    clone_bio = bio_clone_fast(bio, GFP_KERNEL, &__sbdd_bio_set);
+    if (!clone_bio) {
+		pr_err("bio_clone_fast failed\n");
+	} else {
+    	// Set the target device
+		bio_set_dev(clone_bio, bdev);
+    	// Submit the cloned BIO to the target device
+		pr_info("clone_bio.....\n");
+    	submit_bio(clone_bio);
+	}
+}
 
 static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 {
@@ -55,7 +125,7 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 
 	spin_lock(&__sbdd.datalock);
 
-	if (dir)
+    if (dir)
 		memcpy(__sbdd.data + offset, buff, nbytes);
 	else
 		memcpy(buff, __sbdd.data + offset, nbytes);
@@ -75,8 +145,13 @@ static void sbdd_xfer_bio(struct bio *bio)
 	int dir = bio_data_dir(bio);
 	sector_t pos = bio->bi_iter.bi_sector;
 
-	bio_for_each_segment(bvec, bio, iter)
-		pos += sbdd_xfer(&bvec, pos, dir);
+	// Check if target device is set
+	if (__sbdd.target_device) {
+		sbdd_forward_bio(bio, __sbdd.target_device);
+	} else {
+		bio_for_each_segment(bvec, bio, iter)
+			pos += sbdd_xfer(&bvec, pos, dir);
+	}
 }
 
 static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
@@ -111,7 +186,6 @@ static struct block_device_operations const __sbdd_bdev_ops = {
 static int sbdd_create(void)
 {
 	int ret = 0;
-
 	/*
 	This call is somewhat redundant, but used anyways by tradition.
 	The number is to be displayed in /proc/devices (0 for auto).
@@ -130,6 +204,15 @@ static int sbdd_create(void)
 	__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
 	if (!__sbdd.data) {
 		pr_err("unable to alloc data\n");
+		unregister_blkdev(__sbdd_major, SBDD_NAME);
+		return -ENOMEM;
+	}
+
+    pr_info("initializing bio set\n");
+	if (bioset_init(&__sbdd_bio_set, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS)) {
+		pr_err("bioset_init failed\n");
+		vfree(__sbdd.data);
+		unregister_blkdev(__sbdd_major, SBDD_NAME);
 		return -ENOMEM;
 	}
 
@@ -140,6 +223,8 @@ static int sbdd_create(void)
 	__sbdd.q = blk_alloc_queue(GFP_KERNEL);
 	if (!__sbdd.q) {
 		pr_err("call blk_alloc_queue() failed\n");
+		vfree(__sbdd.data);
+		unregister_blkdev(__sbdd_major, SBDD_NAME);
 		return -EINVAL;
 	}
 	blk_queue_make_request(__sbdd.q, sbdd_make_request);
@@ -168,6 +253,14 @@ static int sbdd_create(void)
 	*/
 	pr_info("adding disk\n");
 	add_disk(__sbdd.gd);
+	
+	/* Create sysfs interface */
+	ret = sysfs_create_group(&disk_to_dev(__sbdd.gd)->kobj,	&sbdd_disk_attr_group);
+	if (ret < 0) {
+		vfree(__sbdd.data);
+		unregister_blkdev(__sbdd_major, SBDD_NAME);
+		pr_err("Error creating sysfs group for sbdd device\n");
+	}
 
 	return ret;
 }
@@ -177,6 +270,9 @@ static void sbdd_delete(void)
 	atomic_set(&__sbdd.deleting, 1);
 	atomic_dec(&__sbdd.refs_cnt);
 	wait_event(__sbdd.exitwait, !atomic_read(&__sbdd.refs_cnt));
+
+    /* remove sysfs interface */
+    sysfs_remove_group(&disk_to_dev(__sbdd.gd)->kobj, &sbdd_disk_attr_group);
 
 	/* gd will be removed only after the last reference put */
 	if (__sbdd.gd) {
