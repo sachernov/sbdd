@@ -128,24 +128,24 @@ static const struct attribute_group sbdd_disk_attr_group = {
 
 static void sbdd_forward_bio(struct bio *bio)
 {
-	struct bio *clone_bio[MAX_TARGET_DEVICES];
+	struct bio *clone_bio;
     int i;
+
+	// Clone the original BIO
+	clone_bio = bio_clone_fast(bio, GFP_KERNEL, &__sbdd_bio_set);
+    if (!clone_bio) {
+        pr_err("Failed to clone bio\n");
+        return;
+    }
 
     for (i = 0; i < MAX_TARGET_DEVICES; ++i) {
         if (__sbdd.target_devices[i]) {
-            // Clone the original BIO
-            clone_bio[i] = bio_clone_fast(bio, GFP_KERNEL, &__sbdd_bio_set);
-            if (!clone_bio[i]) {
-                pr_err("Failed to clone bio\n");
-                return;
-            }
-
             // Set the target device
-            bio_set_dev(clone_bio[i], __sbdd.target_devices[i]);
+            bio_set_dev(clone_bio, __sbdd.target_devices[i]);
 
             // Submit the cloned BIO to the target device
             pr_debug("Submit BIO to target device %s\n", __sbdd.target_device_paths[i]);
-            submit_bio(clone_bio[i]);
+            submit_bio(clone_bio);
         }
     }
 }
