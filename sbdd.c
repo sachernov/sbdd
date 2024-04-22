@@ -27,6 +27,8 @@
 #define SBDD_MIB_SECTORS       (1 << (20 - SBDD_SECTOR_SHIFT))
 #define SBDD_NAME              "sbdd"
 
+#define MAX_TARGET_DEVICES     2
+
 struct sbdd {
 	wait_queue_head_t       exitwait;
 	spinlock_t              datalock;
@@ -36,8 +38,8 @@ struct sbdd {
 	u8                      *data;
 	struct gendisk          *gd;
 	struct request_queue    *q;
-	struct block_device     *target_device;               // Target device
-	char                    target_device_path[PATH_MAX]; // Path of the target device
+	struct block_device     *target_devices[MAX_TARGET_DEVICES];               // Target devices
+	char                    target_device_paths[MAX_TARGET_DEVICES][PATH_MAX]; // Paths to the target devices
 };
 
 static struct sbdd      __sbdd;
@@ -48,42 +50,67 @@ static unsigned long    __sbdd_capacity_mib = 100;
 
 static ssize_t target_device_path_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%s\n", __sbdd.target_device_path);
+	char *str = buf;
+	int i;
+
+    for (i = 0; i < MAX_TARGET_DEVICES; ++i)
+        str += sprintf(str, "%s\n", __sbdd.target_device_paths[i]);
+
+    return str - buf;
 }
 
 static ssize_t target_device_path_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t len)
 {
-	static char target_device_path[PATH_MAX];
-	struct block_device *target_device;
-	sector_t capacity;
+	static char target_device_paths[MAX_TARGET_DEVICES][PATH_MAX];
+    struct block_device *target_devices[MAX_TARGET_DEVICES];
+    sector_t capacity;
+	char *path_buf, *token;
+	const char delimiters[] = " ,\t\n";
+    int i, num_devices = 0;
 
-	if (len >= PATH_MAX)
-		return -EINVAL;
+	if (len >= PATH_MAX * MAX_TARGET_DEVICES)
+        return -EINVAL;
 
-    if (len <= 1) {
-		target_device = __sbdd.target_device;
-		__sbdd.target_device = NULL;
-		__sbdd.target_device_path[len-1] = '\0';
+	// Release previously set target devices
+    for (i = 0; i < MAX_TARGET_DEVICES; ++i) {
+        if (__sbdd.target_devices[i]) {
+            blkdev_put(__sbdd.target_devices[i], FMODE_READ|FMODE_WRITE);
+            __sbdd.target_devices[i] = NULL;
+            __sbdd.target_device_paths[i][0] = '\0';
+			target_device_paths[i][0] = '\0';
+        }
+    }
 
-		if (target_device)
-			blkdev_put(target_device, FMODE_READ|FMODE_WRITE);
+	// Copy and parse the comma-separated list of target device paths
+	path_buf = kstrndup(buf, len, GFP_KERNEL);
+    token = strsep(&path_buf, delimiters);
 
-        pr_debug("removed target block device\n");
-	} else {
-		strncpy(target_device_path, buf, len);
-		target_device_path[len-1] = '\0';
-		// Open the target device. In case of failure do nothing.
-	    target_device = blkdev_get_by_path(target_device_path, FMODE_READ|FMODE_WRITE, THIS_MODULE); 
-    	if (IS_ERR(target_device)) {
-        	pr_err("failed to open target block device %s, %ld\n", target_device_path, PTR_ERR(target_device));
+	while (token != NULL && strlen(token) > 0 && num_devices < MAX_TARGET_DEVICES) {
+    	if (strlen(token) < PATH_MAX) {
+        	// Copy the target device path
+        	strcpy(target_device_paths[num_devices], token);
+        	num_devices++;
     	} else {
-			strcpy(__sbdd.target_device_path, target_device_path);
-			__sbdd.target_device = target_device;
-			capacity = get_capacity(__sbdd.target_device->bd_disk);
-
-			pr_debug("set target_device_path = %s as target block device, capacity = %llu\n", __sbdd.target_device_path, capacity);
-		}
-	}
+        	pr_err("Invalid target device path: %s\n", token);
+        	kfree(path_buf);
+        	return -EINVAL;
+    	}
+    	token = strsep(&path_buf, delimiters);
+    }
+    kfree(path_buf);
+	
+	// Open the new target devices
+    for (i = 0; i < num_devices; ++i) {
+        target_devices[i] = blkdev_get_by_path(target_device_paths[i], FMODE_READ|FMODE_WRITE, THIS_MODULE);
+        if (IS_ERR(target_devices[i])) {
+            pr_err("Failed to open target block device %s, %ld\n", target_device_paths[i], PTR_ERR(target_devices[i]));
+        } else {
+            strcpy(__sbdd.target_device_paths[i], target_device_paths[i]);
+            __sbdd.target_devices[i] = target_devices[i];
+            capacity = get_capacity(__sbdd.target_devices[i]->bd_disk);
+            pr_debug("Set target_device_path[%d] = %s as target block device, capacity = %llu\n", i, __sbdd.target_device_paths[i], capacity);
+        }
+    }
 
     return len;
 }
@@ -99,21 +126,28 @@ static const struct attribute_group sbdd_disk_attr_group = {
         .attrs = sbdd_disk_attrs,
 };
 
-static void sbdd_forward_bio(struct bio *bio, struct block_device *bdev)
+static void sbdd_forward_bio(struct bio *bio)
 {
-	struct bio *clone_bio;
-	
-    // Clone the original BIO
-    clone_bio = bio_clone_fast(bio, GFP_KERNEL, &__sbdd_bio_set);
-    if (!clone_bio) {
-		pr_err("failed to clone bio\n");
-	} else {
-    	// Set the target device
-		bio_set_dev(clone_bio, bdev);
-    	// Submit the cloned BIO to the target device
-		pr_info("submit_bio.....\n");
-    	submit_bio(clone_bio);
-	}
+	struct bio *clone_bio[MAX_TARGET_DEVICES];
+    int i;
+
+    for (i = 0; i < MAX_TARGET_DEVICES; ++i) {
+        if (__sbdd.target_devices[i]) {
+            // Clone the original BIO
+            clone_bio[i] = bio_clone_fast(bio, GFP_KERNEL, &__sbdd_bio_set);
+            if (!clone_bio[i]) {
+                pr_err("Failed to clone bio\n");
+                return;
+            }
+
+            // Set the target device
+            bio_set_dev(clone_bio[i], __sbdd.target_devices[i]);
+
+            // Submit the cloned BIO to the target device
+            pr_debug("Submit BIO to target device %s\n", __sbdd.target_device_paths[i]);
+            submit_bio(clone_bio[i]);
+        }
+    }
 }
 
 static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
@@ -150,10 +184,17 @@ static void sbdd_xfer_bio(struct bio *bio)
 	struct bio_vec bvec;
 	int dir = bio_data_dir(bio);
 	sector_t pos = bio->bi_iter.bi_sector;
+	int i, target_device_set_flag = 0;
 
-	// Check if target device is set
-	if (__sbdd.target_device) {
-		sbdd_forward_bio(bio, __sbdd.target_device);
+	// Check if at least one target device is set
+	for (i = 0; i < MAX_TARGET_DEVICES; ++i) {
+		if (__sbdd.target_devices[i]) {
+			target_device_set_flag = 1;
+			break;
+		}
+	}
+	if (target_device_set_flag) {
+		sbdd_forward_bio(bio);
 	} else {
 		bio_for_each_segment(bvec, bio, iter)
 			pos += sbdd_xfer(&bvec, pos, dir);
@@ -242,7 +283,7 @@ static int sbdd_create(void)
 	pr_info("allocating disk\n");
 	__sbdd.gd = alloc_disk(1);
 
-	__sbdd.target_device = NULL;
+    memset(__sbdd.target_devices, 0, sizeof(__sbdd.target_devices));
 
 	/* Configure gendisk */
 	__sbdd.gd->queue = __sbdd.q;
@@ -276,6 +317,7 @@ static int sbdd_create(void)
 
 static void sbdd_delete(void)
 {
+	int i;
 	atomic_set(&__sbdd.deleting, 1);
 	atomic_dec(&__sbdd.refs_cnt);
 	wait_event(__sbdd.exitwait, !atomic_read(&__sbdd.refs_cnt));
@@ -283,10 +325,11 @@ static void sbdd_delete(void)
     /* remove sysfs interface */
     sysfs_remove_group(&disk_to_dev(__sbdd.gd)->kobj, &sbdd_disk_attr_group);
 
-    /* Release target device */
-	if (__sbdd.target_device)
-			blkdev_put(__sbdd.target_device, FMODE_READ|FMODE_WRITE);
-
+    /* Release target devices */
+	for (i = 0; i < MAX_TARGET_DEVICES; ++i)
+        if (__sbdd.target_devices[i])
+            blkdev_put(__sbdd.target_devices[i], FMODE_READ|FMODE_WRITE);
+	
 	/* gd will be removed only after the last reference put */
 	if (__sbdd.gd) {
 		pr_info("deleting disk\n");
