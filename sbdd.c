@@ -61,8 +61,13 @@ static ssize_t target_device_path_store(struct device *dev, struct device_attrib
 		return -EINVAL;
 
     if (len <= 1) {
-		__sbdd.target_device_path[len-1] = '\0';
+		target_device = __sbdd.target_device;
 		__sbdd.target_device = NULL;
+		__sbdd.target_device_path[len-1] = '\0';
+
+		if (target_device)
+			blkdev_put(target_device, FMODE_READ|FMODE_WRITE);
+
         pr_debug("removed target block device\n");
 	} else {
 		strncpy(target_device_path, buf, len);
@@ -75,6 +80,7 @@ static ssize_t target_device_path_store(struct device *dev, struct device_attrib
 			strcpy(__sbdd.target_device_path, target_device_path);
 			__sbdd.target_device = target_device;
 			capacity = get_capacity(__sbdd.target_device->bd_disk);
+
 			pr_debug("set target_device_path = %s as target block device, capacity = %llu\n", __sbdd.target_device_path, capacity);
 		}
 	}
@@ -100,12 +106,12 @@ static void sbdd_forward_bio(struct bio *bio, struct block_device *bdev)
     // Clone the original BIO
     clone_bio = bio_clone_fast(bio, GFP_KERNEL, &__sbdd_bio_set);
     if (!clone_bio) {
-		pr_err("bio_clone_fast failed\n");
+		pr_err("failed to clone bio\n");
 	} else {
     	// Set the target device
 		bio_set_dev(clone_bio, bdev);
     	// Submit the cloned BIO to the target device
-		pr_info("clone_bio.....\n");
+		pr_info("submit_bio.....\n");
     	submit_bio(clone_bio);
 	}
 }
@@ -236,11 +242,14 @@ static int sbdd_create(void)
 	pr_info("allocating disk\n");
 	__sbdd.gd = alloc_disk(1);
 
+	__sbdd.target_device = NULL;
+
 	/* Configure gendisk */
 	__sbdd.gd->queue = __sbdd.q;
 	__sbdd.gd->major = __sbdd_major;
 	__sbdd.gd->first_minor = 0;
 	__sbdd.gd->fops = &__sbdd_bdev_ops;
+
 	/* Represents name in /proc/partitions and /sys/block */
 	scnprintf(__sbdd.gd->disk_name, DISK_NAME_LEN, SBDD_NAME);
 	set_capacity(__sbdd.gd, __sbdd.capacity);
@@ -273,6 +282,10 @@ static void sbdd_delete(void)
 
     /* remove sysfs interface */
     sysfs_remove_group(&disk_to_dev(__sbdd.gd)->kobj, &sbdd_disk_attr_group);
+
+    /* Release target device */
+	if (__sbdd.target_device)
+			blkdev_put(__sbdd.target_device, FMODE_READ|FMODE_WRITE);
 
 	/* gd will be removed only after the last reference put */
 	if (__sbdd.gd) {
