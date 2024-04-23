@@ -38,6 +38,7 @@ struct sbdd {
 	u8                      *data;
 	struct gendisk          *gd;
 	struct request_queue    *q;
+	int                     raid_type;
 	struct block_device     *target_devices[MAX_TARGET_DEVICES];               // Target devices
 	char                    target_device_paths[MAX_TARGET_DEVICES][PATH_MAX]; // Paths to the target devices
 };
@@ -47,6 +48,22 @@ static struct bio_set   __sbdd_bio_set;
 static int              __sbdd_major = 0;
 static unsigned long    __sbdd_capacity_mib = 100;
 
+enum {
+	RAID0,
+	RAID1
+};
+
+static ssize_t raid_type_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	/* TBD */
+	return 0;
+}
+
+static ssize_t raid_type_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t len)
+{
+    /* TBD */
+	return 0;
+}
 
 static ssize_t target_device_path_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -115,10 +132,12 @@ static ssize_t target_device_path_store(struct device *dev, struct device_attrib
     return len;
 }
 
+static DEVICE_ATTR_RW(raid_type);
 static DEVICE_ATTR_RW(target_device_path);
 
 static struct attribute *sbdd_disk_attrs[] = {
-        &dev_attr_target_device_path.attr,
+		&dev_attr_raid_type.attr,
+		&dev_attr_target_device_path.attr,
         NULL,
 };
 
@@ -129,6 +148,8 @@ static const struct attribute_group sbdd_disk_attr_group = {
 static void sbdd_forward_bio(struct bio *bio)
 {
 	struct bio *clone_bio;
+	sector_t sector_offset = 0;
+	sector_t target_sector;
     int i;
 
 	// Clone the original BIO
@@ -138,16 +159,38 @@ static void sbdd_forward_bio(struct bio *bio)
         return;
     }
 
-    for (i = 0; i < MAX_TARGET_DEVICES; ++i) {
-        if (__sbdd.target_devices[i]) {
-            // Set the target device
-            bio_set_dev(clone_bio, __sbdd.target_devices[i]);
+    if (__sbdd.raid_type == RAID1) {
+    	for (i = 0; i < MAX_TARGET_DEVICES; ++i) {
+        	if (__sbdd.target_devices[i]) {
+            	// Set the target device
+            	bio_set_dev(clone_bio, __sbdd.target_devices[i]);
 
-            // Submit the cloned BIO to the target device
-            pr_debug("Submit BIO to target device %s\n", __sbdd.target_device_paths[i]);
-            submit_bio(clone_bio);
-        }
-    }
+            	// Submit the cloned BIO to the target device
+            	pr_debug("Submit BIO to target device %s\n", __sbdd.target_device_paths[i]);
+            	submit_bio(clone_bio);
+        	}
+    	}
+	} else if (__sbdd.raid_type == RAID0) {
+		for (i = 0; i < MAX_TARGET_DEVICES; ++i) {
+			if (__sbdd.target_devices[i]) {
+				// Calculate the sector offset for the target device
+				target_sector = sector_offset + bio->bi_iter.bi_sector;
+
+				// Set the target device and sector
+				bio_set_dev(clone_bio, __sbdd.target_devices[i]);
+				clone_bio->bi_iter.bi_sector = target_sector;
+
+				// Submit the cloned BIO to the target device
+				pr_debug("Submit BIO to target device %s (sector %llu)\n", __sbdd.target_device_paths[i], target_sector);
+				submit_bio(clone_bio);
+
+				// Update the sector offset for the next target device
+				sector_offset += bio->bi_iter.bi_size >> 9; // Convert size in bytes to sectors
+			}
+		}
+	} else {
+		pr_err("unsopported RAID type...\n");
+	}
 }
 
 static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
@@ -284,6 +327,8 @@ static int sbdd_create(void)
 	__sbdd.gd = alloc_disk(1);
 
     memset(__sbdd.target_devices, 0, sizeof(__sbdd.target_devices));
+	/* Set default RAID type */
+	__sbdd.raid_type == RAID1;
 
 	/* Configure gendisk */
 	__sbdd.gd->queue = __sbdd.q;
