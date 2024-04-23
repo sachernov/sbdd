@@ -27,7 +27,8 @@
 #define SBDD_MIB_SECTORS       (1 << (20 - SBDD_SECTOR_SHIFT))
 #define SBDD_NAME              "sbdd"
 
-#define MAX_TARGET_DEVICES     2
+#define MAX_TARGET_DEVICES       2
+#define MAX_SYSFS_STRING_LENGTH  128
 
 struct sbdd {
 	wait_queue_head_t       exitwait;
@@ -48,6 +49,8 @@ static struct bio_set   __sbdd_bio_set;
 static int              __sbdd_major = 0;
 static unsigned long    __sbdd_capacity_mib = 100;
 
+const char *__sbdd_raid_types[] = {"raid0", "raid1"};
+
 enum {
 	RAID0,
 	RAID1
@@ -55,15 +58,55 @@ enum {
 
 static ssize_t raid_type_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	/* TBD */
-	/* Should list all suppoted raid types and underline currently active one */
-	return 0;
+	ssize_t sz = 0;
+	char str[2];
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(__sbdd_raid_types); i++) {
+		sprintf(str, "%d", __sbdd.raid_type);
+		if (strstr(__sbdd_raid_types[i], str))
+			sz += scnprintf(
+				buf + sz, MAX_SYSFS_STRING_LENGTH - sz - 2, "[%s] ", __sbdd_raid_types[i]);
+		else
+			sz += scnprintf(
+				buf + sz, MAX_SYSFS_STRING_LENGTH - sz - 2, "%s ", __sbdd_raid_types[i]);
+	}
+	sz += scnprintf(buf + sz, MAX_SYSFS_STRING_LENGTH - sz, "\n");
+
+	return sz;
 }
 
 static ssize_t raid_type_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t len)
 {
-    /* TBD */
-	return 0;
+	size_t sz;
+	char *str = NULL;
+	int raid_type_supported = 0;
+    int i;
+
+	sz = strlen(buf);
+	str = kstrdup(buf, GFP_KERNEL);
+	if (!str)
+			return -ENOMEM;
+
+	/* ignore trailing newline */
+	if (sz > 0 && str[sz - 1] == '\n')
+		str[sz - 1] = 0x00;
+
+	for (i = 0; i < ARRAY_SIZE(__sbdd_raid_types); i++) {
+		if (!strcmp(__sbdd_raid_types[i], str)) {
+			str += strlen("raid");
+			if (kstrtoint(str, 10, &__sbdd.raid_type)) 
+				return -EINVAL;
+
+			raid_type_supported = 1;
+			break;
+		}
+	}
+
+	if (!raid_type_supported)
+		pr_err("Raid type %s is not supported\n", buf);
+
+	return sz;
 }
 
 static ssize_t target_device_path_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -329,7 +372,7 @@ static int sbdd_create(void)
 
     memset(__sbdd.target_devices, 0, sizeof(__sbdd.target_devices));
 	/* Set default RAID type */
-	__sbdd.raid_type == RAID1;
+	__sbdd.raid_type = RAID1;
 
 	/* Configure gendisk */
 	__sbdd.gd->queue = __sbdd.q;
