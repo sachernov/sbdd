@@ -56,6 +56,7 @@ enum {
 static ssize_t raid_type_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	/* TBD */
+	/* Should list all suppoted raid types and underline currently active one */
 	return 0;
 }
 
@@ -189,7 +190,7 @@ static void sbdd_forward_bio(struct bio *bio)
 			}
 		}
 	} else {
-		pr_err("unsopported RAID type...\n");
+		pr_err("unsupported RAID type...\n");
 	}
 }
 
